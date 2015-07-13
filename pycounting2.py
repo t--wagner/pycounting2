@@ -7,6 +7,9 @@ from scipy.optimize import curve_fit
 from datetime import datetime
 import cycounting2 as _cycounting
 
+from scipy.optimize import curve_fit
+from scipy.special import binom
+
 
 class CountingDataset(h5pym.Dataset):
 
