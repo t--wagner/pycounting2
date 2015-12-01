@@ -1,14 +1,18 @@
 import numpy as np
 cimport numpy as np
 
+from collections import defaultdict
+
 # Declare fused type to use are generic datatype
 ctypedef fused datatype:
-    unsigned short
     short
-    unsigned int
+    unsigned short
     int
-    unsigned long
+    unsigned int
     long
+    unsigned long
+    long long
+    unsigned long long
     float
     double
 
@@ -77,6 +81,36 @@ def digitize(np.ndarray[datatype, ndim=1] trace,
     # Return the buffer that is necassary to buffer
     new_signal[0] = (new_signal[0][0], new_signal[0][1] - first_level[1], new_signal[0][2])
     return new_signal, trace[-average:].copy()
+
+
+def count_total(np.ndarray[datatype, ndim=1] event_trace,
+                datatype delta,
+                unsigned long long counts,
+                histogram_dict):
+
+    cdef datatype position
+    cdef unsigned long long nr_of_events, i, j
+
+    # Iterate through all events
+    nr_of_events = len(event_trace)
+    for i in range(nr_of_events):
+
+        counts = 1
+
+        # Count all events in a window
+        position = event_trace[i]
+        j = 1
+        while ((i + j) < nr_of_events) and (event_trace[i + j] < (position + delta)):
+            j += 1
+            counts += 1
+
+        # Break out if the indices
+        if (i + j) == nr_of_events:
+            break
+
+        histogram_dict[counts] += 1
+
+    return counts
 
 
 def count(np.ndarray[datatype, ndim=1] events,

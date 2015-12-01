@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 
-import h5pym
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from collections import defaultdict
 from datetime import datetime
-import cycounting2 as _cycounting
-
+import matplotlib.pyplot as plt
+import numpy as np
 from scipy.optimize import curve_fit
 from scipy.special import binom
+import h5pym
+import cycounting2 as cyc
 
 
 class CountingDataset(h5pym.Dataset):
@@ -191,7 +190,7 @@ class CounterTraceDataset(CountingDataset):
         self._position = signal[-1]
 
         # Count
-        self._offset, self._counts = _cycounting.tcount(signal, self.delta, self._offset, self._counts)
+        self._offset, self._counts = cyc.tcount(signal, self.delta, self._offset, self._counts)
         self.extend(self._counts[:-1])
         del self._counts[:-1]
         return self._counts
@@ -458,7 +457,7 @@ class Adc(object):
         low0, high0, low1, high1 = self.abs
 
         # CYTHON: Digitize the data
-        signal, self._buffer = _cycounting.digitize(data, signal,
+        signal, self._buffer = cyc.digitize(data, signal,
                                                     int(self.average),
                                                     low0, high0, low1, high1)
 
@@ -651,6 +650,42 @@ class Histogram(HistogramBase):
         freqs = self._freqs[index]
 
         return bins, freqs
+
+
+class Counter(HistogramBase):
+
+    def __init__(self, state, delta, position=0):
+        HistogramBase.__init__(self)
+        self._state = state
+        self._histogram_dict = defaultdict(int)
+        self._position = position
+        self._delta = delta
+        self._counts = 0
+
+    @property
+    def delta(self):
+        return self._delta
+
+    @property
+    def histogram(self):
+
+        histogram = list(zip(*sorted(self._histogram_dict.items())))
+        return np.array(histogram[0]), np.array(histogram[1])
+
+    def count(self, signal):
+        """Count the states for signal.
+
+        """
+        if isinstance(signal, SignalDataset):
+            positions = self._position + np.cumsum(signal['length'])
+            event_trace = positions[signal['state'] == self._state]
+        else:
+            event_trace = self._position + signal
+
+        self._position = signal[-1]
+
+        # Count
+        self._counts = cyc.count_total(event_trace, self._delta, self._counts, self._histogram_dict)
 
 
 class Fit(object):
