@@ -111,6 +111,60 @@ def count_total(np.ndarray[datatype, ndim=1] event_trace,
         histogram_dict[counts] += 1
 
     return counts
+    
+    
+def count_total2(np.ndarray[datatype, ndim=1] event_trace,
+                unsigned long long window,
+                histogram_dict):
+    
+    cdef datatype position, delta, d_b, d_f
+    cdef unsigned long long nr_of_events, i, j, 
+    cdef unsigned long long counts
+    
+    # Iterate through all events
+    delta = window
+    counts = 1
+    i = 0
+    j = 1
+    position = event_trace[i]
+    nr_of_events = len(event_trace)
+    
+    
+    # Count the number of events in first window
+    
+    while ((j < nr_of_events) and (event_trace[j] < (position + delta))):
+        j += 1
+        counts += 1
+    
+    
+    histogram_dict[counts] += 1
+    
+    # Move the events through the counting window
+    while j < nr_of_events:
+        
+        d_f = event_trace[i + 1] - position
+        d_b = event_trace[j] - (position + delta)
+        
+        # An events leaves the electron
+        if d_f < d_b:
+            counts -= 1
+            i += 1
+            position += d_f             
+        
+        # An event enters the 
+        elif d_f > d_b:                           
+            counts += 1 
+            j += 1
+            position += d_b
+        else:
+            i += 1
+            j += 1
+            position += d_f
+        
+        # Add the count to histogram
+        histogram_dict[counts] += 1
+
+    return histogram_dict
 
 
 def count(np.ndarray[datatype, ndim=1] events,

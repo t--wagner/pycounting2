@@ -685,7 +685,7 @@ class Counter(HistogramBase):
         self._position = signal[-1]
 
         # Count
-        self._counts = cyc.count_total(event_trace, self._delta, self._counts, self._histogram_dict)
+        self._counts = cyc.count_total2(event_trace, self._delta, self._histogram_dict)
 
 
 class Fit(object):
