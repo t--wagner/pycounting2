@@ -84,9 +84,12 @@ class SignalGroup(h5pym.Group):
         signal_dtype = np.dtype([('state', state_type),
                                  ('length', length_type),
                                  ('value', value_type)])
+                                 
+        fillvalue = np.array((-1,0,np.nan), dtype=signal_dtype)
 
         dataset = self._hdf.create_dataset(key, dtype=signal_dtype, shape=(0,),
-                                           maxshape=(None,), compression='gzip')
+                                           maxshape=(None,), compression='gzip',
+                                           fillvalue=fillvalue)
 
         dataset.attrs['nsigma'] = nsigma
         dataset.attrs['average'] = average
