@@ -8,7 +8,18 @@ from scipy.optimize import curve_fit
 from scipy.special import binom
 import h5pym
 import cycounting2 as cyc
+from operator import itemgetter
 
+
+class CountingFile(h5pym.File):
+
+    def create_dataset(self, key, override=False, date=True, dtype=np.float64, fillvalue=np.nan, chunks=(10000, ), **kwargs):
+
+
+        dset = super().create_dataset(key, override, date, dtype,  fillvalue,
+                                      shape=(0, ),  maxshape=(None, ), chunks=chunks, compression='gzip')
+
+        return CountingDataset(dset)
 
 class CountingDataset(h5pym.Dataset):
 
@@ -36,6 +47,7 @@ class CountingDataset(h5pym.Dataset):
 
             # Return current data window
             yield self.__getitem__(slice(position, position+length))
+
 
     def extend(self, data):
         """Append new data at the end of signal.
@@ -84,7 +96,7 @@ class SignalGroup(h5pym.Group):
         signal_dtype = np.dtype([('state', state_type),
                                  ('length', length_type),
                                  ('value', value_type)])
-                                 
+
         fillvalue = np.array((-1,0,np.nan), dtype=signal_dtype)
 
         dataset = self._hdf.create_dataset(key, dtype=signal_dtype, shape=(0,),
@@ -258,6 +270,14 @@ class Level(object):
         self.center = center
         self.sigma = abs(sigma)
 
+    def __getitem__(self, key):
+        if key == 0:
+            return self.low
+        elif key == 1:
+            return self.high
+        else:
+            return IndexError('Out of index', key)
+
     @classmethod
     def from_abs(cls, low, high):
         sigma = float(high - low) / 2
@@ -316,7 +336,7 @@ class System(object):
         return cls(*levels)
 
     @classmethod
-    def from_histogram(cls, histogram, start_parameters=None, levels=2, sigma=1):
+    def from_histogram(cls, histogram, start_parameters=None, levels=2, rph=20, mpd=20, snr=4, sf=3, smooth=10):
         """Create System from Histogram.
 
         start_parameters: (a_0, mu_0 sigma_0, .... a_N, mu_N, sigma_N)
@@ -327,41 +347,38 @@ class System(object):
             start_parameters = list()
 
             # Get number of bins
-            bins = histogram.bins
+            bins  = histogram.bins
+
+            freqs = histogram.freqs
+            freqs = np.convolve(freqs, np.ones(smooth)/smooth, mode='same')
             freqs_n = histogram.freqs_n
 
-            for peak in range(levels):
-                # Get maximum and its position
-                hight = np.max(freqs_n)
-                center = np.mean(bins[freqs_n == hight])
+            mph = histogram.max_freq / rph
+
+            mpd = 0.05 / ((bins[-1] - bins[0]) / len(bins))
+
+            peak_positions = detect_peaks(freqs, mph, mpd)
+
+            centers = [bins[position] for  position in peak_positions]
+            sigma = np.abs(np.average(np.diff(centers))) / (2*snr)
+
+            if not len(peak_positions) == levels:
+                raise ValueError('Wrong peak number peaks', peak_positions)
+
+            for position in peak_positions:
+                hight = freqs_n[position]
+                center = bins[position]
 
                 # Fit a normal distribution around the value
-                fit = Fit(fnormal, bins, freqs_n, (hight, center, sigma))
-                start_parameters.append(fit.parameters)
-
-                center = fit.parameters[1]
-                sigma = np.abs(fit.parameters[2])
-
-                # Substrate fit from data
-                freqs_n -= fit(bins)
-
-                index = ((bins < (center - 2 * sigma)) | ((center + 2 * sigma) < bins))
-                bins = bins[index]
-                freqs_n = freqs_n[index]
-
-        # Sort levels by position
-        start_parameters = sorted(start_parameters, key=itemgetter(1))
-        start_parameters = np.concatenate(start_parameters)
-        #print start_parameters
+                start_parameters.append((hight, center, sigma))
 
         # Make a level fit
         fit = Fit(flevels, histogram.bins, histogram.freqs_n, start_parameters)
 
         # Filter levels=(mu_0, sigma_0, ..., mu_N, sigma_N)
-        index = np.array([False, True, True] * (len(fit.parameters) / 3))
+        index = np.array([False, True, True] * (len(fit.parameters) // 3))
         levels = fit.parameters[index]
-        system = cls(*[Level(levels[i], levels[i+1])
-                       for i in range(0, len(levels), 2)])
+        system = cls(*[Level(levels[i], sf * levels[i+1]) for i in range(0, len(levels), 2)])
 
         return system, fit
 
@@ -613,13 +630,21 @@ class HistogramBase(object):
             return fcumulants(moments)
 
 
+def irq(data):
+    return np.percentile(data, 75, interpolation='higher') - np.percentile(data, 25, interpolation='lower')
+
 class Histogram(HistogramBase):
     """Histogram class.
 
     """
 
-    def __init__(self, bins=100, width=None, data=None):
+
+    def __init__(self, bins=None, width=None, data=None):
         HistogramBase.__init__(self)
+
+        if bins is None:
+            h = 2 * irq(data) / ((data.size)**(1/3))
+            bins = int((np.max(data) - np.min(data)) / h)
 
         if data is None:
             self._freqs = None
@@ -653,6 +678,62 @@ class Histogram(HistogramBase):
         freqs = self._freqs[index]
 
         return bins, freqs
+
+
+
+class Time(Histogram):
+
+
+    def fit_exp(self, a=None, rate=None, range=None, normed=False):
+        """Fit the time Histogram with an exponential function.
+        """
+
+        if rate is None:
+            rate = -1 * self.mean
+
+        if normed:
+            if a is None:
+                a = self.max_freq_n
+            freqs = self.freqs_n
+        else:
+            if a is None:
+                a = self.max_freq
+            freqs = self.freqs
+
+        bins = self.bins
+
+        if range:
+            index = (range[0] <= bins) & (bins <= range[1])
+            bins = bins[index]
+            freqs = freqs[index]
+
+        fit = Fit.exp(bins, freqs, a, rate)
+        fit.rate = np.abs(fit.parameters[-1])
+        return fit
+
+    def rate(self, sample_rate=500e3, range=None):
+        """Rate extracted by the fit_exp method.
+        """
+
+        return sample_rate / np.abs(self.fit_exp(range=range).parameters[-1])
+
+    def fft(self, sampling_rate=1):
+        """Create FFT from frequencies.
+        """
+        return FFT.from_data(self.freqs, sampling_rate)
+
+    def plot(self, ax=None, normed=False, log=True, **kwargs):
+        """Plot time distribution.
+        """
+        if not ax:
+            ax = plt.gca()
+
+        line = Histogram.plot(self, ax, normed, **kwargs)
+
+        if log:
+            ax.set_yscale('log')
+
+        return line
 
 
 class Counter(HistogramBase):
@@ -849,3 +930,164 @@ def c2(t, tau_in, tau_out):
 
 def c2_n(t, tau_in, tau_out):
     return 1/2. * (1 + a(tau_in, tau_out)**2)
+
+
+def detect_peaks(x, mph=None, mpd=1, threshold=0, edge='rising',
+                 kpsh=False, valley=False, show=False, ax=None):
+
+    """Detect peaks in data based on their amplitude and other features.
+
+    Parameters
+    ----------
+    x : 1D array_like
+        data.
+    mph : {None, number}, optional (default = None)
+        detect peaks that are greater than minimum peak height.
+    mpd : positive integer, optional (default = 1)
+        detect peaks that are at least separated by minimum peak distance (in
+        number of data).
+    threshold : positive number, optional (default = 0)
+        detect peaks (valleys) that are greater (smaller) than `threshold`
+        in relation to their immediate neighbors.
+    edge : {None, 'rising', 'falling', 'both'}, optional (default = 'rising')
+        for a flat peak, keep only the rising edge ('rising'), only the
+        falling edge ('falling'), both edges ('both'), or don't detect a
+        flat peak (None).
+    kpsh : bool, optional (default = False)
+        keep peaks with same height even if they are closer than `mpd`.
+    valley : bool, optional (default = False)
+        if True (1), detect valleys (local minima) instead of peaks.
+    show : bool, optional (default = False)
+        if True (1), plot data in matplotlib figure.
+    ax : a matplotlib.axes.Axes instance, optional (default = None).
+
+    Returns
+    -------
+    ind : 1D array_like
+        indeces of the peaks in `x`.
+
+    Notes
+    -----
+    The detection of valleys instead of peaks is performed internally by simply
+    negating the data: `ind_valleys = detect_peaks(-x)`
+
+    The function can handle NaN's
+
+    Examples
+    --------
+    >>> from detect_peaks import detect_peaks
+    >>> x = np.random.randn(100)
+    >>> x[60:81] = np.nan
+    >>> # detect all peaks and plot data
+    >>> ind = detect_peaks(x, show=True)
+    >>> print(ind)
+
+    >>> x = np.sin(2*np.pi*5*np.linspace(0, 1, 200)) + np.random.randn(200)/5
+    >>> # set minimum peak height = 0 and minimum peak distance = 20
+    >>> detect_peaks(x, mph=0, mpd=20, show=True)
+
+    >>> x = [0, 1, 0, 2, 0, 3, 0, 2, 0, 1, 0]
+    >>> # set minimum peak distance = 2
+    >>> detect_peaks(x, mpd=2, show=True)
+
+    >>> x = np.sin(2*np.pi*5*np.linspace(0, 1, 200)) + np.random.randn(200)/5
+    >>> # detection of valleys instead of peaks
+    >>> detect_peaks(x, mph=0, mpd=20, valley=True, show=True)
+
+    >>> x = [0, 1, 1, 0, 1, 1, 0]
+    >>> # detect both edges
+    >>> detect_peaks(x, edge='both', show=True)
+
+    >>> x = [-2, 1, -2, 2, 1, 1, 3, 0]
+    >>> # set threshold = 2
+    >>> detect_peaks(x, threshold = 2, show=True)
+    """
+
+    x = np.atleast_1d(x).astype('float64')
+    if x.size < 3:
+        return np.array([], dtype=int)
+    if valley:
+        x = -x
+    # find indices of all peaks
+    dx = x[1:] - x[:-1]
+    # handle NaN's
+    indnan = np.where(np.isnan(x))[0]
+    if indnan.size:
+        x[indnan] = np.inf
+        dx[np.where(np.isnan(dx))[0]] = np.inf
+    ine, ire, ife = np.array([[], [], []], dtype=int)
+    if not edge:
+        ine = np.where((np.hstack((dx, 0)) < 0) & (np.hstack((0, dx)) > 0))[0]
+    else:
+        if edge.lower() in ['rising', 'both']:
+            ire = np.where((np.hstack((dx, 0)) <= 0) & (np.hstack((0, dx)) > 0))[0]
+        if edge.lower() in ['falling', 'both']:
+            ife = np.where((np.hstack((dx, 0)) < 0) & (np.hstack((0, dx)) >= 0))[0]
+    ind = np.unique(np.hstack((ine, ire, ife)))
+    # handle NaN's
+    if ind.size and indnan.size:
+        # NaN's and values close to NaN's cannot be peaks
+        ind = ind[np.in1d(ind, np.unique(np.hstack((indnan, indnan-1, indnan+1))), invert=True)]
+    # first and last values of x cannot be peaks
+    if ind.size and ind[0] == 0:
+        ind = ind[1:]
+    if ind.size and ind[-1] == x.size-1:
+        ind = ind[:-1]
+    # remove peaks < minimum peak height
+    if ind.size and mph is not None:
+        ind = ind[x[ind] >= mph]
+    # remove peaks - neighbors < threshold
+    if ind.size and threshold > 0:
+        dx = np.min(np.vstack([x[ind]-x[ind-1], x[ind]-x[ind+1]]), axis=0)
+        ind = np.delete(ind, np.where(dx < threshold)[0])
+    # detect small peaks closer than minimum peak distance
+    if ind.size and mpd > 1:
+        ind = ind[np.argsort(x[ind])][::-1]  # sort ind by peak height
+        idel = np.zeros(ind.size, dtype=bool)
+        for i in range(ind.size):
+            if not idel[i]:
+                # keep peaks with the same height if kpsh is True
+                idel = idel | (ind >= ind[i] - mpd) & (ind <= ind[i] + mpd) \
+                    & (x[ind[i]] > x[ind] if kpsh else True)
+                idel[i] = 0  # Keep current peak
+        # remove the small peaks and sort back the indices by their occurrence
+        ind = np.sort(ind[~idel])
+
+    if show:
+        if indnan.size:
+            x[indnan] = np.nan
+        if valley:
+            x = -x
+        _plot(x, mph, mpd, threshold, edge, valley, ax, ind)
+
+    return ind
+
+
+def _plot(x, mph, mpd, threshold, edge, valley, ax, ind):
+    """Plot results of the detect_peaks function, see its help."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('matplotlib is not available.')
+    else:
+        if ax is None:
+            _, ax = plt.subplots(1, 1, figsize=(8, 4))
+
+        ax.plot(x, 'b', lw=1)
+        if ind.size:
+            label = 'valley' if valley else 'peak'
+            label = label + 's' if ind.size > 1 else label
+            ax.plot(ind, x[ind], '+', mfc=None, mec='r', mew=2, ms=8,
+                    label='%d %s' % (ind.size, label))
+            ax.legend(loc='best', framealpha=.5, numpoints=1)
+        ax.set_xlim(-.02*x.size, x.size*1.02-1)
+        ymin, ymax = x[np.isfinite(x)].min(), x[np.isfinite(x)].max()
+        yrange = ymax - ymin if ymax > ymin else 1
+        ax.set_ylim(ymin - 0.1*yrange, ymax + 0.1*yrange)
+        ax.set_xlabel('Data #', fontsize=14)
+        ax.set_ylabel('Amplitude', fontsize=14)
+        mode = 'Valley detection' if valley else 'Peak detection'
+        ax.set_title("%s (mph=%s, mpd=%d, threshold=%s, edge='%s')"
+                     % (mode, str(mph), mpd, str(threshold), edge))
+        # plt.grid()
+        plt.show()
